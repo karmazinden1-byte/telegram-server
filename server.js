@@ -17,6 +17,7 @@ const DATA_DIR = path.join(__dirname, "data");
 const DB_PATH = path.join(DATA_DIR, "db.json");
 
 const ASSETS = ["RUB", "UAH", "USD", "EUR", "BTC", "USDT", "TRX", "SOL", "ETH"];
+const EXCHANGE_COMMISSION_RATE = 0.001;
 const USD_RATES = {
   USD: 1,
   EUR: 1.08,
@@ -30,16 +31,51 @@ const USD_RATES = {
 };
 
 const DEPOSIT_CHANNELS = [
-  { id: "banks_rf", title: "Банки РФ", currencies: ["RUB"] },
-  { id: "banks_ua", title: "Банки Украины", currencies: ["UAH"] },
-  { id: "banks_eu", title: "Банки Европы", currencies: ["EUR"] },
-  { id: "banks_cis", title: "Банки СНГ", currencies: ["USD", "EUR", "RUB"] },
-  { id: "global_banks", title: "Крупные банки мира", currencies: ["USD", "EUR"] },
-  { id: "retail_networks", title: "Платёжные сети и кассы", currencies: ["USD", "EUR", "RUB", "UAH"] },
-  { id: "usdt_trc20", title: "USDT TRC-20", currencies: ["USDT"] },
-  { id: "bitcoin", title: "Bitcoin", currencies: ["BTC"] },
-  { id: "ethereum", title: "Ethereum", currencies: ["ETH", "USDT"] },
-  { id: "solana", title: "Solana", currencies: ["SOL", "USDT"] },
+  {
+    id: "banks_rf",
+    title: "Банки РФ",
+    currencies: ["RUB"],
+    providers: ["Сбербанк", "Т-Банк", "Альфа-Банк", "ВТБ", "Газпромбанк", "Райффайзен", "ЮMoney", "СБП"],
+  },
+  {
+    id: "banks_ua",
+    title: "Банки Украины",
+    currencies: ["UAH"],
+    providers: ["ПриватБанк", "monobank", "ПУМБ", "Ощадбанк", "А-Банк", "УкрСиббанк", "Sense Bank"],
+  },
+  {
+    id: "banks_eu",
+    title: "Банки Европы",
+    currencies: ["EUR"],
+    providers: ["SEPA", "Revolut", "Wise", "N26", "Monese", "Paysera", "Santander", "Deutsche Bank"],
+  },
+  {
+    id: "banks_cis",
+    title: "Банки СНГ",
+    currencies: ["USD", "EUR", "RUB"],
+    providers: ["Kaspi", "Halyk", "TBC Bank", "Bank of Georgia", "Ameriabank", "Inecobank", "Moldindconbank"],
+  },
+  {
+    id: "global_banks",
+    title: "Крупные банки мира",
+    currencies: ["USD", "EUR"],
+    providers: ["SWIFT", "Wise", "Revolut", "Payoneer", "Chase", "Bank of America", "HSBC", "Barclays"],
+  },
+  {
+    id: "retail_networks",
+    title: "Платёжные сети и кассы",
+    currencies: ["USD", "EUR", "RUB", "UAH"],
+    providers: ["Western Union", "MoneyGram", "Ria", "KoronaPay", "Золотая Корона", "Contact", "PayPal"],
+  },
+  { id: "usdt_trc20", title: "USDT TRC-20", currencies: ["USDT"], providers: ["TRC-20"] },
+  { id: "bitcoin", title: "Bitcoin", currencies: ["BTC"], providers: ["BTC"] },
+  { id: "ethereum", title: "Ethereum", currencies: ["ETH", "USDT"], providers: ["ERC-20", "Ethereum Mainnet"] },
+  { id: "solana", title: "Solana", currencies: ["SOL", "USDT"], providers: ["Solana SPL"] },
+];
+
+const CASH_TATE_PLANS = [
+  { id: "six_months", title: "CashTate 6 месяцев", months: 6, monthlyRate: 0.15, directReferralRate: 0.05, level2Rate: 0.02, level3Rate: 0.01 },
+  { id: "twelve_months", title: "CashTate 12 месяцев", months: 12, monthlyRate: 0.18, directReferralRate: 0.07, level2Rate: 0.03, level3Rate: 0.02 },
 ];
 
 const KYC_COUNTRIES = {
@@ -127,7 +163,11 @@ const defaultDb = {
   depositRequests: [],
   withdrawalRequests: [],
   kycRequests: [],
+  exchangeRequests: [],
+  cashTateDeposits: [],
+  referralRewards: [],
   auditLog: [],
+  ratesCache: null,
 };
 
 app.use(cors());
@@ -191,6 +231,56 @@ function approvedDepositUsd(db, userId) {
     .reduce((sum, request) => sum + toUsd(request.amount, request.currency), 0);
 }
 
+async function getRates(db) {
+  const cached = db.ratesCache;
+  if (cached && Date.now() - cached.fetchedAt < 60 * 1000) return cached;
+
+  const rates = { ...USD_RATES };
+  let source = "fallback";
+
+  try {
+    const [cryptoResponse, fiatResponse] = await Promise.all([
+      fetch(
+        "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,tron,tether&vs_currencies=usd"
+      ),
+      fetch("https://api.frankfurter.app/latest?from=USD&to=EUR,UAH,RUB"),
+    ]);
+    const crypto = await cryptoResponse.json();
+    const fiat = await fiatResponse.json();
+
+    rates.BTC = Number(crypto.bitcoin?.usd || rates.BTC);
+    rates.ETH = Number(crypto.ethereum?.usd || rates.ETH);
+    rates.SOL = Number(crypto.solana?.usd || rates.SOL);
+    rates.TRX = Number(crypto.tron?.usd || rates.TRX);
+    rates.USDT = Number(crypto.tether?.usd || rates.USDT);
+    rates.EUR = 1 / Number(fiat.rates?.EUR || 0.925);
+    rates.UAH = 1 / Number(fiat.rates?.UAH || 38.5);
+    rates.RUB = 1 / Number(fiat.rates?.RUB || 90);
+    source = "coingecko+frankfurter";
+  } catch (err) {
+    console.error("Rates fetch failed:", err.message);
+  }
+
+  db.ratesCache = { rates, source, fetchedAt: Date.now(), fetchedAtIso: now() };
+  writeDb(db);
+  return db.ratesCache;
+}
+
+function getReferralChain(db, userId) {
+  const chain = [];
+  let user = db.users[userId];
+
+  for (let i = 0; i < 3; i += 1) {
+    if (!user?.invitedBy) break;
+    const inviter = Object.values(db.users).find((item) => item.referralCode === user.invitedBy);
+    if (!inviter) break;
+    chain.push(inviter);
+    user = inviter;
+  }
+
+  return chain;
+}
+
 function publicUser(user) {
   return {
     id: user.id,
@@ -199,6 +289,7 @@ function publicUser(user) {
     username: user.username,
     role: user.role,
     isAdmin: user.role === "admin",
+    status: user.status || "active",
     profile: user.profile,
     balances: user.balances,
     referralCode: user.referralCode,
@@ -230,6 +321,9 @@ function auth(req, res, next) {
   const user = session ? db.users[session.userId] : null;
 
   if (!user) return res.status(401).json({ ok: false, message: "Unauthorized" });
+  if (user.status === "banned" || user.status === "blocked") {
+    return res.status(403).json({ ok: false, message: "Account is blocked" });
+  }
 
   req.db = db;
   req.user = user;
@@ -257,6 +351,7 @@ function upsertUser(db, payload) {
     username: payload.username || existing?.username || "",
     passwordHash: existing?.passwordHash || null,
     role,
+    status: existing?.status || "active",
     profile: {
       fullName: "",
       phone: "",
@@ -290,9 +385,12 @@ app.get("/meta", (req, res) => {
   res.json({
     assets: ASSETS,
     commissionRate: COMMISSION_RATE,
+    exchangeCommissionRate: EXCHANGE_COMMISSION_RATE,
     unverifiedDepositLimitUsd: UNVERIFIED_DEPOSIT_LIMIT_USD,
     usdRates: USD_RATES,
     depositChannels: DEPOSIT_CHANNELS,
+    withdrawalChannels: DEPOSIT_CHANNELS,
+    cashTatePlans: CASH_TATE_PLANS,
     kycCountries: KYC_COUNTRIES,
     documentLabels: DOCUMENT_LABELS,
     rules: {
@@ -397,6 +495,11 @@ app.get("/wallets/:userId", (req, res) => {
   res.json(ASSETS.map((asset) => ({ asset, balanceAvailable: balances[asset] || 0 })));
 });
 
+app.get("/rates", auth, async (req, res) => {
+  const rates = await getRates(req.db);
+  res.json(rates);
+});
+
 app.get("/referrals/:userId", (req, res) => {
   const db = readDb();
   const userId = String(req.params.userId || "u1");
@@ -455,7 +558,7 @@ app.get("/deposit-requests", auth, (req, res) => {
 });
 
 app.post("/deposit-requests", auth, (req, res) => {
-  const { amount, currency, channel, comment = "" } = req.body;
+  const { amount, currency, channel, provider = "", comment = "" } = req.body;
   if (!amount || Number(amount) <= 0 || !currency || !channel) {
     return res.status(400).json({ ok: false, message: "amount, currency and channel are required" });
   }
@@ -482,6 +585,7 @@ app.post("/deposit-requests", auth, (req, res) => {
     commissionRate: COMMISSION_RATE,
     currency,
     channel,
+    provider,
     comment,
     status: "awaiting_requisites",
     assignedRequisites: null,
@@ -551,7 +655,7 @@ app.get("/withdrawal-requests", auth, (req, res) => {
 });
 
 app.post("/withdrawal-requests", auth, (req, res) => {
-  const { amount, currency, method, details, comment = "" } = req.body;
+  const { amount, currency, method, provider = "", details, comment = "" } = req.body;
   if (!amount || Number(amount) <= 0 || !currency || !method || !details) {
     return res.status(400).json({ ok: false, message: "amount, currency, method and details are required" });
   }
@@ -577,6 +681,7 @@ app.post("/withdrawal-requests", auth, (req, res) => {
     commissionRate: COMMISSION_RATE,
     currency,
     method,
+    provider,
     details,
     comment,
     status: "pending",
@@ -611,6 +716,122 @@ app.patch("/admin/withdrawal-requests/:id", auth, adminOnly, (req, res) => {
   });
   writeDb(req.db);
   res.json(request);
+});
+
+app.post("/exchange", auth, async (req, res) => {
+  const { fromAsset, toAsset, amount } = req.body;
+  const numericAmount = Number(amount);
+
+  if (!fromAsset || !toAsset || fromAsset === toAsset || !numericAmount || numericAmount <= 0) {
+    return res.status(400).json({ ok: false, message: "fromAsset, toAsset and positive amount are required" });
+  }
+
+  const user = req.db.users[req.user.telegramId];
+  if (Number(user.balances[fromAsset] || 0) < numericAmount) {
+    return res.status(400).json({ ok: false, message: "Insufficient balance" });
+  }
+
+  const { rates } = await getRates(req.db);
+  const grossToAmount = (numericAmount * Number(rates[fromAsset] || 1)) / Number(rates[toAsset] || 1);
+  const feeAmount = grossToAmount * EXCHANGE_COMMISSION_RATE;
+  const receivedAmount = grossToAmount - feeAmount;
+
+  user.balances[fromAsset] = Number(user.balances[fromAsset] || 0) - numericAmount;
+  user.balances[toAsset] = Number(user.balances[toAsset] || 0) + receivedAmount;
+
+  const exchange = {
+    id: id("ex"),
+    userId: user.telegramId,
+    fromAsset,
+    toAsset,
+    amount: numericAmount,
+    grossToAmount,
+    feeAmount,
+    receivedAmount,
+    commissionRate: EXCHANGE_COMMISSION_RATE,
+    createdAt: now(),
+  };
+
+  req.db.exchangeRequests.unshift(exchange);
+  audit(req.db, user.telegramId, "exchange.create", { exchangeId: exchange.id });
+  writeDb(req.db);
+  res.status(201).json(exchange);
+});
+
+app.get("/exchange", auth, (req, res) => {
+  const requests =
+    req.user.role === "admin"
+      ? req.db.exchangeRequests
+      : req.db.exchangeRequests.filter((item) => item.userId === req.user.telegramId);
+  res.json(requests);
+});
+
+app.get("/cashtate", auth, (req, res) => {
+  const deposits =
+    req.user.role === "admin"
+      ? req.db.cashTateDeposits
+      : req.db.cashTateDeposits.filter((item) => item.userId === req.user.telegramId);
+  const rewards =
+    req.user.role === "admin"
+      ? req.db.referralRewards
+      : req.db.referralRewards.filter((item) => item.userId === req.user.telegramId);
+  res.json({ plans: CASH_TATE_PLANS, deposits, rewards });
+});
+
+app.post("/cashtate/deposits", auth, (req, res) => {
+  const { planId, asset, amount } = req.body;
+  const plan = CASH_TATE_PLANS.find((item) => item.id === planId);
+  const numericAmount = Number(amount);
+  const user = req.db.users[req.user.telegramId];
+
+  if (!plan || !asset || !numericAmount || numericAmount <= 0) {
+    return res.status(400).json({ ok: false, message: "planId, asset and positive amount are required" });
+  }
+  if (Number(user.balances[asset] || 0) < numericAmount) {
+    return res.status(400).json({ ok: false, message: "Insufficient balance" });
+  }
+
+  user.balances[asset] = Number(user.balances[asset] || 0) - numericAmount;
+  const startedAt = new Date();
+  const lockedUntil = new Date(startedAt);
+  lockedUntil.setMonth(lockedUntil.getMonth() + plan.months);
+
+  const deposit = {
+    id: id("ct"),
+    userId: user.telegramId,
+    userName: user.firstName || user.username || user.telegramId,
+    planId: plan.id,
+    asset,
+    amount: numericAmount,
+    monthlyRate: plan.monthlyRate,
+    expectedMonthlyProfit: numericAmount * plan.monthlyRate,
+    status: "active",
+    startedAt: startedAt.toISOString(),
+    lockedUntil: lockedUntil.toISOString(),
+  };
+  req.db.cashTateDeposits.unshift(deposit);
+
+  const chain = getReferralChain(req.db, user.telegramId);
+  const rates = [plan.directReferralRate, plan.level2Rate, plan.level3Rate];
+  chain.forEach((inviter, index) => {
+    req.db.referralRewards.unshift({
+      id: id("rew"),
+      userId: inviter.telegramId,
+      sourceUserId: user.telegramId,
+      cashTateDepositId: deposit.id,
+      level: index + 1,
+      asset,
+      rate: rates[index],
+      fromMonthlyProfit: deposit.expectedMonthlyProfit,
+      amount: deposit.expectedMonthlyProfit * rates[index],
+      status: "accrual_projection",
+      createdAt: now(),
+    });
+  });
+
+  audit(req.db, user.telegramId, "cashtate.deposit_create", { depositId: deposit.id });
+  writeDb(req.db);
+  res.status(201).json(deposit);
 });
 
 app.get("/kyc", auth, (req, res) => {
@@ -665,6 +886,29 @@ app.patch("/admin/kyc/:id", auth, adminOnly, (req, res) => {
   res.json(request);
 });
 
+app.patch("/admin/users/:id", auth, adminOnly, (req, res) => {
+  const user = req.db.users[String(req.params.id)];
+  if (!user) return res.status(404).json({ ok: false, message: "User not found" });
+
+  const { status, balancePatch, adminNote = "" } = req.body;
+  if (status) user.status = status;
+
+  if (balancePatch?.asset && Number.isFinite(Number(balancePatch.amount))) {
+    const asset = balancePatch.asset;
+    user.balances[asset] = Number(user.balances[asset] || 0) + Number(balancePatch.amount);
+  }
+
+  user.adminNote = adminNote || user.adminNote || "";
+  user.updatedAt = now();
+  audit(req.db, req.user.telegramId, "admin.user_update", {
+    targetUserId: user.telegramId,
+    status: user.status,
+    balancePatch,
+  });
+  writeDb(req.db);
+  res.json(publicUser(user));
+});
+
 app.get("/admin/overview", auth, adminOnly, (req, res) => {
   const users = Object.values(req.db.users);
   res.json({
@@ -672,6 +916,9 @@ app.get("/admin/overview", auth, adminOnly, (req, res) => {
     depositRequests: req.db.depositRequests,
     withdrawalRequests: req.db.withdrawalRequests,
     kycRequests: req.db.kycRequests,
+    exchangeRequests: req.db.exchangeRequests,
+    cashTateDeposits: req.db.cashTateDeposits,
+    referralRewards: req.db.referralRewards,
     depositMethods: req.db.depositMethods,
     auditLog: req.db.auditLog.slice(0, 100),
     stats: {
